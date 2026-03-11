@@ -1,0 +1,64 @@
+version: '3.8'
+
+# ─────────────────────────────────────────────────────────────────
+# Distributed Consensus Blueprint
+# This docker-compose acts as a conceptual blueprint demonstrating
+# how the monolithic sensor_clustering.py script would be decoupled 
+# into independent microservices in a real production environment.
+# ─────────────────────────────────────────────────────────────────
+
+services:
+  worker-kmeans:
+    build: .
+    environment:
+      - MODEL_TYPE=kmeans
+    volumes:
+      - ./data_sensors.csv:/app/data_sensors.csv
+      - ./predictions:/app/predictions
+    command: ["python", "predict.py", "--model", "kmeans"]
+
+  worker-rf:
+    build: .
+    environment:
+      - MODEL_TYPE=random_forest
+    volumes:
+      - ./data_sensors.csv:/app/data_sensors.csv
+      - ./predictions:/app/predictions
+    command: ["python", "predict.py", "--model", "random_forest"]
+
+  worker-label-propagation:
+    build: .
+    environment:
+      - MODEL_TYPE=label_propagation
+    volumes:
+      - ./data_sensors.csv:/app/data_sensors.csv
+      - ./predictions:/app/predictions
+    command: ["python", "predict.py", "--model", "label_propagation"]
+
+  worker-label-spreading:
+    build: .
+    environment:
+      - MODEL_TYPE=label_spreading
+    # Label Spreading requires more memory; we establish resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    volumes:
+      - ./data_sensors.csv:/app/data_sensors.csv
+      - ./predictions:/app/predictions
+    command: ["python", "predict.py", "--model", "label_spreading"]
+
+  consensus-aggregator:
+    build: .
+    environment:
+      - MODEL_TYPE=aggregator
+    depends_on:
+      - worker-kmeans
+      - worker-rf
+      - worker-label-propagation
+      - worker-label-spreading
+    volumes:
+      - ./data_sensors.csv:/app/data_sensors.csv
+      - ./predictions:/app/predictions
+    command: ["python", "aggregator.py", "--await-all"]
