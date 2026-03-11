@@ -16,6 +16,7 @@ Pipeline:
 
 import warnings
 import os
+import joblib
 import numpy as np
 import pandas as pd
 import shap
@@ -283,7 +284,8 @@ print(f"\n{SEPARATOR}")
 print(f"  STEP 5: FINAL MODELS — Features: {SELECTED_NAMES}")
 print(SEPARATOR)
 
-X_final = StandardScaler().fit_transform(X_raw[:, SELECTED_FEATURES])
+scaler_final = StandardScaler()
+X_final = scaler_final.fit_transform(X_raw[:, SELECTED_FEATURES])
 y_semi = np.full(len(df), -1)
 y_semi[labeled_mask] = y_true_labeled
 
@@ -518,3 +520,15 @@ output["All4_Agree"] = agree_all
 output_path = os.path.join(script_dir, "sensor_clustering_results.csv")
 output.to_csv(output_path, index=False)
 print(f"  Results exported to: {output_path}")
+
+# Serialize scaler + RF model for deployment
+artifacts_dir = os.path.join(script_dir, "artifacts")
+os.makedirs(artifacts_dir, exist_ok=True)
+
+scaler_path = os.path.join(artifacts_dir, "scaler.joblib")
+model_path = os.path.join(artifacts_dir, "rf_model.joblib")
+joblib.dump(scaler_final, scaler_path)
+joblib.dump(rf_full, model_path)
+print(f"  Scaler saved to:    {scaler_path}")
+print(f"  RF model saved to:  {model_path}")
+print(f"  Selected features:  {SELECTED_FEATURES} ({SELECTED_NAMES})")
