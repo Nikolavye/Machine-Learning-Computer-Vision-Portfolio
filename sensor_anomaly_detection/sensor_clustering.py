@@ -32,7 +32,8 @@ from sklearn.metrics import (
     normalized_mutual_info_score, classification_report, confusion_matrix,
 )
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*n_init.*", category=FutureWarning)
 np.random.seed(42)
 
 SEPARATOR = "=" * 70
@@ -81,7 +82,17 @@ print(SEPARATOR)
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 csv_path = os.path.join(script_dir, "data_sensors.csv")
-df = pd.read_csv(csv_path)  
+df = pd.read_csv(csv_path)
+
+# ── Data validation ──
+assert df.shape[1] >= 21, f"Expected >=21 columns (20 sensors + Label), got {df.shape[1]}"
+assert "Label" in df.columns, "Missing 'Label' column"
+nan_counts = df.iloc[:, :20].isna().sum().sum()
+assert nan_counts == 0, f"Found {nan_counts} NaN values in sensor features"
+valid_labels = {1, 2, 3}
+actual_labels = set(df["Label"].dropna().astype(int).unique())
+assert actual_labels.issubset(valid_labels), f"Unexpected labels: {actual_labels - valid_labels}"
+
 X_raw = df.iloc[:, :20].values
 feature_names = [f"Sensor {i}" for i in range(20)]
 labeled_mask = df["Label"].notna().values
@@ -165,8 +176,8 @@ print("\n[3a] Embedded / Wrapper importance")
 n_runs = 5
 importance_sum = np.zeros(20)
 
-for _ in range(n_runs):
-    rf = RandomForestClassifier(n_estimators=100, random_state=None, n_jobs=-1)
+for run_i in range(n_runs):
+    rf = RandomForestClassifier(n_estimators=100, random_state=42 + run_i, n_jobs=-1)
     rf.fit(X_labeled_full, y_true_labeled)
     importance_sum += rf.feature_importances_
 
@@ -335,16 +346,16 @@ print(f"\n  [Resubstitution — labeled 40 samples]")
 print(f"  Accuracy: {accuracy_score(y_true_labeled, ls_labels[labeled_mask]):.2%}")
 
 print(f"\n  [5-Fold CV on 40 labeled samples]")
-trues, preds = cv_semi_supervised(
+ls_cv_trues, ls_cv_preds = cv_semi_supervised(
     LabelSpreading, X_final, labeled_indices, y_true_labeled,
     kernel="rbf", gamma=20, alpha=0.5, max_iter=1000,
 )
-print(f"  Accuracy: {accuracy_score(trues, preds):.2%} ({(trues == preds).sum()}/{len(trues)})")
-print(f"  ARI: {adjusted_rand_score(trues, preds):.4f}")
-print(f"  NMI: {normalized_mutual_info_score(trues, preds):.4f}")
+print(f"  Accuracy: {accuracy_score(ls_cv_trues, ls_cv_preds):.2%} ({(ls_cv_trues == ls_cv_preds).sum()}/{len(ls_cv_trues)})")
+print(f"  ARI: {adjusted_rand_score(ls_cv_trues, ls_cv_preds):.4f}")
+print(f"  NMI: {normalized_mutual_info_score(ls_cv_trues, ls_cv_preds):.4f}")
 print(f"\n  Confusion Matrix:")
-print(confusion_matrix(trues, preds))
-print(f"\n{classification_report(trues, preds, digits=4)}")
+print(confusion_matrix(ls_cv_trues, ls_cv_preds))
+print(f"\n{classification_report(ls_cv_trues, ls_cv_preds, digits=4)}")
 
 dist = dict(zip(*np.unique(ls_labels, return_counts=True)))
 print(f"  [Full dataset distribution]")
@@ -374,16 +385,16 @@ print(f"\n  [Resubstitution — labeled 40 samples]")
 print(f"  Accuracy: {accuracy_score(y_true_labeled, lp_labels[labeled_mask]):.2%}")
 
 print(f"\n  [5-Fold CV on 40 labeled samples]")
-trues, preds = cv_semi_supervised(
+lp_cv_trues, lp_cv_preds = cv_semi_supervised(
     LabelPropagation, X_final, labeled_indices, y_true_labeled,
     kernel="rbf", gamma=20, max_iter=1000,
 )
-print(f"  Accuracy: {accuracy_score(trues, preds):.2%} ({(trues == preds).sum()}/{len(trues)})")
-print(f"  ARI: {adjusted_rand_score(trues, preds):.4f}")
-print(f"  NMI: {normalized_mutual_info_score(trues, preds):.4f}")
+print(f"  Accuracy: {accuracy_score(lp_cv_trues, lp_cv_preds):.2%} ({(lp_cv_trues == lp_cv_preds).sum()}/{len(lp_cv_trues)})")
+print(f"  ARI: {adjusted_rand_score(lp_cv_trues, lp_cv_preds):.4f}")
+print(f"  NMI: {normalized_mutual_info_score(lp_cv_trues, lp_cv_preds):.4f}")
 print(f"\n  Confusion Matrix:")
-print(confusion_matrix(trues, preds))
-print(f"\n{classification_report(trues, preds, digits=4)}")
+print(confusion_matrix(lp_cv_trues, lp_cv_preds))
+print(f"\n{classification_report(lp_cv_trues, lp_cv_preds, digits=4)}")
 
 dist = dict(zip(*np.unique(lp_labels, return_counts=True)))
 print(f"  [Full dataset distribution]")
@@ -474,18 +485,10 @@ print()
 print(f"  {'Method':<25} {'Silhouette':>10} {'5-Fold CV':>10} {'Distribution (1/2/3)':>22}")
 print(f"  {'─'*70}")
 
-# Pre-compute CV accuracies
-ls_trues, ls_preds = cv_semi_supervised(
-    LabelSpreading, X_final, labeled_indices, y_true_labeled,
-    kernel="rbf", gamma=20, alpha=0.5, max_iter=1000)
-lp_trues, lp_preds = cv_semi_supervised(
-    LabelPropagation, X_final, labeled_indices, y_true_labeled,
-    kernel="rbf", gamma=20, max_iter=1000)
-
 results = [
     ("K-Means",           km_labels,  km_acc_labeled),
-    ("Label Spreading",   ls_labels,  accuracy_score(ls_trues, ls_preds)),
-    ("Label Propagation", lp_labels,  accuracy_score(lp_trues, lp_preds)),
+    ("Label Spreading",   ls_labels,  accuracy_score(ls_cv_trues, ls_cv_preds)),
+    ("Label Propagation", lp_labels,  accuracy_score(lp_cv_trues, lp_cv_preds)),
     ("Random Forest",     rf_labels,  rf_cv_scores.mean()),
 ]
 for name, labels, cv_acc in results:

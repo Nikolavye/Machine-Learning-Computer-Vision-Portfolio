@@ -14,12 +14,20 @@ Outputs:
 """
 
 import csv
+import logging
+import torch
 from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
 
 # Paths
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +44,9 @@ VOTE_WINDOW = 20
 MIN_VOTES_FOR_STABLE_ID = 3
 SMOOTH_WINDOW = 10
 
+# Track memory management — evict tracks not seen for this many frames
+TRACK_EVICT_AFTER = 200
+
 # Visualization
 TEAM_COLORS = {
     "red": (0, 0, 255),
@@ -44,7 +55,43 @@ TEAM_COLORS = {
     "goalkeeper_blue": (255, 100, 0),
 }
 
+# Detection thresholds
+YOLO_CONF = 0.10
+YOLO_IOU = 0.5
+
+# Ideal team colors (BGR)
+IDEAL_RED = np.array([50, 50, 200])
+IDEAL_WHITE = np.array([240, 240, 240])
+IDEAL_YELLOW = np.array([21, 169, 172])
+IDEAL_BLUE = np.array([130, 70, 50])
+IDEAL_BLACK = np.array([30, 30, 30])
+
+# Color classification thresholds
+BLUE_PIXEL_RATIO_THRESH = 0.25
+WHITE_UPPER_RATIO_THRESH = 0.12
+WHITE_LOWER_RATIO_THRESH = 0.15
+RED_PIXEL_RATIO_THRESH = 0.50
+YELLOW_PIXEL_RATIO_THRESH = 0.30
+COLOR_REJECT_DIST = 200
+GATE_PENALTY = 1000
+
+# Pitch filter
+GRASS_GREEN_MIN_RATIO = 0.15
+
+# Static track suppression
+STATIC_DRIFT_THRESH = 8.0
+STATIC_MIN_HISTORY = 12
+
 MODELS_DIR = CASE_DIR / "models"
+
+
+def get_device() -> str:
+    """Auto-detect best available device: cuda > mps > cpu."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def choose_model_path() -> str:
@@ -101,7 +148,7 @@ def is_on_pitch(box, frame: np.ndarray) -> bool:
         & (foot_hsv[:, :, 1] >= 35)
         & (foot_hsv[:, :, 2] >= 25)
     )
-    if float(np.mean(green_mask)) < 0.15:
+    if float(np.mean(green_mask)) < GRASS_GREEN_MIN_RATIO:
         return False
 
     return True
@@ -110,7 +157,7 @@ def is_on_pitch(box, frame: np.ndarray) -> bool:
 def classify_by_strict_colors(frame, box):
     """Classify a detection into red / white / goalkeeper_yellow / goalkeeper_blue.
 
-    Returns (feature, upper_bgr, vote_override) or (None, None, None) if rejected.
+    Returns (upper_bgr, vote_override) or (None, None) if rejected.
     """
     x1, y1, x2, y2 = map(int, box)
     h = y2 - y1
@@ -125,7 +172,7 @@ def classify_by_strict_colors(frame, box):
     lower_crop = frame[max(y1 + int(h * 0.4), 0):max(y1 + int(h * 0.7), y1 + 1), cx1:cx2]
 
     if upper_crop.size == 0 or lower_crop.size == 0:
-        return None, None, None
+        return None, None
 
     def get_fg_pixels(crop):
         hsv_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -157,16 +204,10 @@ def classify_by_strict_colors(frame, box):
 
     white_r, red_r, yellow_r, blue_r = pixel_vote_team(upper_crop)
 
-    ideal_red = np.array([50, 50, 200])
-    ideal_white = np.array([240, 240, 240])
-    ideal_yellow = np.array([21, 169, 172])
-    ideal_blue = np.array([130, 70, 50])
-    ideal_black = np.array([30, 30, 30])
-
-    sr = np.linalg.norm(upper_bgr - ideal_red) * 0.6 + np.linalg.norm(lower_bgr - ideal_red) * 0.4
-    sw = np.linalg.norm(upper_bgr - ideal_white) * 0.6 + np.linalg.norm(lower_bgr - ideal_white) * 0.4
-    sref = np.linalg.norm(upper_bgr - ideal_yellow) * 0.8 + np.linalg.norm(lower_bgr - ideal_black) * 0.2
-    sblue = np.linalg.norm(upper_bgr - ideal_blue) * 0.7 + np.linalg.norm(lower_bgr - ideal_blue) * 0.3
+    sr = np.linalg.norm(upper_bgr - IDEAL_RED) * 0.6 + np.linalg.norm(lower_bgr - IDEAL_RED) * 0.4
+    sw = np.linalg.norm(upper_bgr - IDEAL_WHITE) * 0.6 + np.linalg.norm(lower_bgr - IDEAL_WHITE) * 0.4
+    sref = np.linalg.norm(upper_bgr - IDEAL_YELLOW) * 0.8 + np.linalg.norm(lower_bgr - IDEAL_BLACK) * 0.2
+    sblue = np.linalg.norm(upper_bgr - IDEAL_BLUE) * 0.7 + np.linalg.norm(lower_bgr - IDEAL_BLUE) * 0.3
 
     # Pixel vote override for robust classification
     vote_override = None
@@ -175,49 +216,45 @@ def classify_by_strict_colors(frame, box):
     ub_hsv = cv2.cvtColor(np.uint8([[upper_bgr]]), cv2.COLOR_BGR2HSV)[0][0]
     ub_h, ub_s, ub_v = int(ub_hsv[0]), int(ub_hsv[1]), int(ub_hsv[2])
 
-    if blue_r > 0.25 or (90 <= ub_h <= 130 and ub_s >= 50 and ub_v > 40):
+    if blue_r > BLUE_PIXEL_RATIO_THRESH or (90 <= ub_h <= 130 and ub_s >= 50 and ub_v > 40):
         vote_override = "goalkeeper_blue"
-    elif white_r > 0.12 and white_r_lower > 0.15:
+    elif white_r > WHITE_UPPER_RATIO_THRESH and white_r_lower > WHITE_LOWER_RATIO_THRESH:
         vote_override = "white"
-    elif red_r > 0.50 and white_r < 0.08 and white_r_lower < 0.15:
+    elif red_r > RED_PIXEL_RATIO_THRESH and white_r < 0.08 and white_r_lower < WHITE_LOWER_RATIO_THRESH:
         vote_override = "red"
-    elif yellow_r > 0.30:
+    elif yellow_r > YELLOW_PIXEL_RATIO_THRESH:
         vote_override = "goalkeeper_yellow"
 
     # Yellow/referee gate
     is_yellow_hue = 20 <= ub_h <= 38
     is_high_sat = ub_s >= 120
-    raw_yellow_dist = np.linalg.norm(upper_bgr - ideal_yellow)
+    raw_yellow_dist = np.linalg.norm(upper_bgr - IDEAL_YELLOW)
     is_very_close_to_yellow = raw_yellow_dist < 50
 
     if not ((is_yellow_hue and is_high_sat) or is_very_close_to_yellow):
-        sref += 1000
+        sref += GATE_PENALTY
 
-    if yellow_r > 0.30:
+    if yellow_r > YELLOW_PIXEL_RATIO_THRESH:
         sref = min(sref, 50)
 
     # Blue goalkeeper gate
     if not (90 <= ub_h <= 130 and ub_s >= 50):
-        sblue += 1000
+        sblue += GATE_PENALTY
 
-    feature = np.concatenate([upper_bgr, lower_bgr])
     min_score = min(sr, sw, sref, sblue)
-    if min_score > 200:
-        return None, None, None
+    if min_score > COLOR_REJECT_DIST:
+        return None, None
 
-    return feature, upper_bgr, vote_override
+    return upper_bgr, vote_override
 
 
 def get_team_by_color(b, g, r):
     """Fallback classification when pixel voting has no override."""
-    ideal_white = np.array([240, 240, 240])
-    ideal_red = np.array([50, 50, 200])
-    ideal_yellow = np.array([21, 169, 172])
     color = np.array([b, g, r])
 
-    d_white = np.linalg.norm(color - ideal_white)
-    d_red = np.linalg.norm(color - ideal_red)
-    d_referee = np.linalg.norm(color - ideal_yellow)
+    d_white = np.linalg.norm(color - IDEAL_WHITE)
+    d_red = np.linalg.norm(color - IDEAL_RED)
+    d_referee = np.linalg.norm(color - IDEAL_YELLOW)
 
     ub_hsv = cv2.cvtColor(np.uint8([[color]]), cv2.COLOR_BGR2HSV)[0][0]
 
@@ -227,8 +264,8 @@ def get_team_by_color(b, g, r):
 
     # Yellow-green goalkeeper
     if ub_hsv[1] < 120 and d_referee > 50:
-        d_referee += 1000
-    if d_referee < d_white and d_referee < d_red and d_referee < 1000:
+        d_referee += GATE_PENALTY
+    if d_referee < d_white and d_referee < d_red and d_referee < GATE_PENALTY:
         return "goalkeeper_yellow"
 
     # Dark clothing gate
@@ -267,8 +304,9 @@ def draw_overlay(frame, smooth_red, smooth_white, gk_y, gk_b):
 
 
 def main():
+    device = get_device()
     model_path = choose_model_path()
-    print(f"Loading model: {model_path}")
+    log.info("Loading model: %s (device: %s)", model_path, device)
     model = YOLO(model_path)
 
     cap = cv2.VideoCapture(str(VIDEO_PATH))
@@ -279,7 +317,7 @@ def main():
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Video: {frame_w}x{frame_h} @ {fps:.1f}fps, {total_frames} frames")
+    log.info("Video: %dx%d @ %.1ffps, %d frames", frame_w, frame_h, fps, total_frames)
 
     writer = cv2.VideoWriter(
         str(OUTPUT_VIDEO),
@@ -290,6 +328,7 @@ def main():
 
     track_votes = defaultdict(lambda: deque(maxlen=VOTE_WINDOW))
     track_centers = defaultdict(lambda: deque(maxlen=20))
+    track_last_seen = {}  # tid -> frame_idx, for LRU eviction
     static_track_ids = set()
     smooth_red_buf = deque(maxlen=SMOOTH_WINDOW)
     smooth_white_buf = deque(maxlen=SMOOTH_WINDOW)
@@ -305,12 +344,12 @@ def main():
         results = model.track(
             frame,
             persist=True,
-            conf=0.10,
-            iou=0.5,
+            conf=YOLO_CONF,
+            iou=YOLO_IOU,
             tracker=TRACKER_CFG,
             classes=[0],
             verbose=False,
-            device="mps",
+            device=device,
         )
         r = results[0]
 
@@ -336,17 +375,17 @@ def main():
             cy = float((box[1] + box[3]) / 2.0)
             hist = track_centers[int(tid)]
             hist.append((cx, cy))
-            if len(hist) >= 12:
+            if len(hist) >= STATIC_MIN_HISTORY:
                 arr = np.array(hist, dtype=np.float32)
                 drift = float(np.max(np.linalg.norm(arr - arr[0], axis=1)))
-                if drift < 8.0 and cy < frame_h * 0.68:
+                if drift < STATIC_DRIFT_THRESH and cy < frame_h * 0.68:
                     static_track_ids.add(int(tid))
             if int(tid) in static_track_ids:
                 continue
 
             # Classify by color
-            strict_feat, upper_bgr, vote_override = classify_by_strict_colors(frame, box)
-            if strict_feat is None:
+            upper_bgr, vote_override = classify_by_strict_colors(frame, box)
+            if upper_bgr is None:
                 continue
 
             if vote_override is not None:
@@ -361,6 +400,7 @@ def main():
         frame_tracks_by_team = {"red": set(), "white": set(), "goalkeeper_yellow": set(), "goalkeeper_blue": set()}
 
         for tid, box, conf, instant_team in detections:
+            track_last_seen[tid] = frame_idx
             votes = track_votes[tid]
             votes.append(instant_team)
             if len(votes) >= MIN_VOTES_FOR_STABLE_ID:
@@ -377,6 +417,16 @@ def main():
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             txt = f"{team} id:{tid} {conf:.2f}"
             cv2.putText(frame, txt, (x1, max(18, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
+
+        # Evict stale tracks to prevent memory growth on long videos
+        if frame_idx % 100 == 0:
+            stale = [t for t, last in track_last_seen.items()
+                     if frame_idx - last > TRACK_EVICT_AFTER]
+            for t in stale:
+                track_votes.pop(t, None)
+                track_centers.pop(t, None)
+                track_last_seen.pop(t, None)
+                static_track_ids.discard(t)
 
         raw_red = len(frame_tracks_by_team["red"])
         raw_white = len(frame_tracks_by_team["white"])
@@ -407,12 +457,10 @@ def main():
         )
 
         if frame_idx % 50 == 0:
-            print(
-                f"frame={frame_idx:4d} "
-                f"raw=({raw_red},{raw_white}) "
-                f"smooth=({smooth_red},{smooth_white}) "
-                f"gk=({raw_gk_y},{raw_gk_b}) "
-                f"dets={len(detections)}"
+            log.info(
+                "frame=%4d raw=(%d,%d) smooth=(%d,%d) gk=(%d,%d) dets=%d",
+                frame_idx, raw_red, raw_white, smooth_red, smooth_white,
+                raw_gk_y, raw_gk_b, len(detections),
             )
 
         frame_idx += 1
@@ -437,14 +485,12 @@ def main():
         writer_csv.writeheader()
         writer_csv.writerows(csv_rows)
 
-    print(f"\nDone.")
-    print(f"  Video: {OUTPUT_VIDEO}")
-    print(f"  CSV:   {OUTPUT_CSV}")
+    log.info("Done. Video: %s | CSV: %s", OUTPUT_VIDEO, OUTPUT_CSV)
     if csv_rows:
         reds = [r["smooth_red"] for r in csv_rows]
         whites = [r["smooth_white"] for r in csv_rows]
-        print(f"  Avg smooth red:   {float(np.mean(reds)):.2f}")
-        print(f"  Avg smooth white: {float(np.mean(whites)):.2f}")
+        log.info("Avg smooth red: %.2f, Avg smooth white: %.2f",
+                 float(np.mean(reds)), float(np.mean(whites)))
 
 
 if __name__ == "__main__":

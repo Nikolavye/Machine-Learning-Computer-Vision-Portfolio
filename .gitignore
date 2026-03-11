@@ -1,6 +1,25 @@
 .venv/
+.run_env/
 .DS_Store
 __pycache__/
 *.pyc
 .claude/
+
+# Model weights
 *.pt
+*.onnx
+
+# Serialized artifacts
+sensor_anomaly_detection/artifacts/
+
+# Output frames and videos
+sports_player_tracking/frames_result*/
+sports_player_tracking/output_*.mp4
+sports_player_tracking/output_*.csv
+sports_player_tracking/eval_*.csv
+
+# Sensor output
+sensor_anomaly_detection/output/
+
+# Jupyter
+.ipynb_checkpoints/

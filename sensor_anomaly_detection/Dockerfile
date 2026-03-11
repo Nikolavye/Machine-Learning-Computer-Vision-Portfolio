@@ -16,9 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application
 COPY . .
 
+# Non-root user for security
+RUN useradd --create-home appuser
+USER appuser
+
 # Environment variables for production
 ENV PYTHONUNBUFFERED=1
 ENV MODEL_CONSENSUS_THRESHOLD=1.0
 
-# In a real batch pipeline (e.g., triggered by Airflow), we execute the main script.
 CMD ["python", "sensor_clustering.py"]
