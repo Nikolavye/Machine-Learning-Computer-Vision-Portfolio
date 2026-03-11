@@ -13,7 +13,6 @@ Usage:
 import argparse
 import logging
 import os
-import sys
 
 import joblib
 import numpy as np
@@ -69,13 +68,38 @@ def predict(scaler, model, X_raw: np.ndarray) -> tuple:
     return labels, confidences
 
 
+def select_feature_matrix(df: pd.DataFrame) -> np.ndarray:
+    """Extract the training feature subset from a dataframe.
+
+    Prefer explicit sensor names when present so inference remains correct even if
+    CSV column order changes. Fall back to positional indexing for older files.
+    """
+    if all(name in df.columns for name in FEATURE_NAMES):
+        selected = df.loc[:, FEATURE_NAMES].apply(pd.to_numeric, errors="raise")
+    else:
+        if df.shape[1] <= max(SELECTED_FEATURES):
+            raise ValueError(
+                "CSV must either contain the named columns "
+                f"{FEATURE_NAMES} or at least {max(SELECTED_FEATURES) + 1} columns."
+            )
+        log.warning(
+            "Input CSV does not expose expected sensor names %s; falling back to "
+            "positional columns %s. Named columns are safer for inference.",
+            FEATURE_NAMES,
+            SELECTED_FEATURES,
+        )
+        selected = df.iloc[:, SELECTED_FEATURES].apply(pd.to_numeric, errors="raise")
+
+    if selected.isna().any().any():
+        raise ValueError("Selected inference features contain missing values.")
+
+    return selected.to_numpy()
+
+
 def predict_from_csv(scaler, model, csv_path: str) -> pd.DataFrame:
     """Run prediction on a CSV file with 20 sensor columns."""
     df = pd.read_csv(csv_path)
-    if df.shape[1] < 20:
-        raise ValueError(f"Expected >=20 sensor columns, got {df.shape[1]}")
-
-    X_selected = df.iloc[:, SELECTED_FEATURES].values
+    X_selected = select_feature_matrix(df)
     labels, confidences = predict(scaler, model, X_selected)
 
     df["Predicted_Label"] = labels

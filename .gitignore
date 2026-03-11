@@ -3,7 +3,12 @@
 .DS_Store
 __pycache__/
 *.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 .claude/
+*.log
+*.pid
 
 # Model weights
 *.pt
@@ -16,10 +21,12 @@ sensor_anomaly_detection/artifacts/
 sports_player_tracking/frames_result*/
 sports_player_tracking/output_*.mp4
 sports_player_tracking/output_*.csv
+sports_player_tracking/counts_*.csv
 sports_player_tracking/eval_*.csv
 
 # Sensor output
 sensor_anomaly_detection/output/
+sensor_anomaly_detection/*results*.csv
 
 # Jupyter
 .ipynb_checkpoints/

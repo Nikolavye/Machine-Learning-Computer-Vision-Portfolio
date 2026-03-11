@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__
+*.pyc
+*.log
+*.pid
+frames_result_c/
+output_c.mp4
+counts_c.csv
+eval_c_100.csv
